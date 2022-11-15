@@ -1,4 +1,4 @@
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashMap;
 
 use crate::error::{Error, Result};
 use crate::git::{CmRepoMap, Msg};
@@ -28,7 +28,6 @@ use tokio_stream::wrappers::{ReceiverStream, ReadDirStream};
 
 
 type CmIpsMap = Arc<Mutex<AHashMap<String, Vec<String>>>>;
-type CmChanged = Arc<Mutex<AHashSet<String>>>;
 
 struct Context {
     client: Client,
@@ -36,7 +35,6 @@ struct Context {
     tx_cms: Sender<Msg>,
     cm_ips: CmIpsMap,
     cm_repo: CmRepoMap,
-    cm_changed: CmChanged,
 }
 
 impl Context {
@@ -45,7 +43,6 @@ impl Context {
         tx_cms: Sender<Msg>,
         cm_ips: CmIpsMap,
         cm_repo: CmRepoMap,
-        cm_changed: CmChanged,
         namespace: String,
     ) -> Self {
         Self {
@@ -53,7 +50,6 @@ impl Context {
             tx_cms,
             cm_ips,
             cm_repo,
-            cm_changed,
             namespace,
         }
     }
@@ -70,8 +66,7 @@ async fn directory_to_data_map(obj_name: &str)
    let rds = ReadDirStream::new(rd)
         .filter_map(|file| {
             future::ready(
-                file.inspect_err(|e| println!("Error: {}", e))
-                    .ok()
+                file.inspect_err(|e| println!("Error: {}", e)).ok()
             )
         })
         .filter_map(|file| async {
@@ -102,7 +97,7 @@ async fn directory_to_data_map(obj_name: &str)
     Ok(vec)
 }
 
-fn trans(ips: Option<&Vec<String>>)
+fn transform(ips: Option<&Vec<String>>)
 -> Option<Vec<impl Future<Output = Result<reqwest::Response, reqwest::Error>>>>
 {
     let client = reqwest::Client::new();
@@ -159,17 +154,17 @@ async fn reconcile(obj: Arc<ConfigMap>, ctx: Arc<Context>) -> Result<Action> {
     if clean_map {
         // Existia un repo y ahora se ha eliminado
         let repo = ctx.cm_repo.lock().remove(&obj_name);
-        // notificar 
-        if let Some(repo) = repo && let Some(_thanos @ true) = repo.thanos {
+        if let Some(repo) = repo {
             if let Err(e) = ctx.tx_cms.send(Msg::new_destroy(obj.name_any())).await {
                 println!("Error: {}", &e);
             }
-            let requests = trans(ctx.cm_ips.lock().get(&obj_name));
-            notify(requests).await;
+            // notificar 
+            if repo.thanos == Some(true) {
+                let requests = transform(ctx.cm_ips.lock().get(&obj_name));
+                notify(requests).await;
+            }
         }
-    }
-
-    if ctx.cm_changed.lock().remove(&obj_name) {
+    } else {
         // For each directory:
         let Ok(vec) = directory_to_data_map(&obj_name).await else {
             return Ok(Action::requeue(Duration::from_secs(3600))); // TODO: transformar el error
@@ -187,16 +182,14 @@ async fn reconcile(obj: Arc<ConfigMap>, ctx: Arc<Context>) -> Result<Action> {
             Ok(_) => {
                 let do_notify = {
                     let repo_mutex = ctx.cm_repo.lock();
-                    if let Some(repo) = repo_mutex.get(&obj_name)
-                        && let Some(_thanos @ true) = repo.thanos
-                    {
+                    if let Some(repo) = repo_mutex.get(&obj_name) && repo.thanos == Some(true) {
                         true
                     } else {
                         false
                     }
                 };
                 if do_notify {
-                    let requests = trans(ctx.cm_ips.lock().get(&obj_name));
+                    let requests = transform(ctx.cm_ips.lock().get(&obj_name));
                     notify(requests).await;
                 }
             },
@@ -218,12 +211,9 @@ pub async fn run(
     let pods = Api::<Pod>::namespaced(client.clone(), &namespace);
     let pod_watcher = watcher(pods, ListParams::default());
     let cm_ips: CmIpsMap = Arc::new(Mutex::new(AHashMap::new()));
-    let cm_changed: CmChanged = Arc::new(Mutex::new(AHashSet::new()));
-    let ctx = Arc::new(
-        Context::new(client, tx_cms, cm_ips.clone(), cm_repo, cm_changed.clone(), namespace));
+    let ctx = Arc::new(Context::new(client, tx_cms, cm_ips.clone(), cm_repo, namespace));
 
-    let rx_repo_stream = ReceiverStream::new(rx_repo)
-        .map(move |cm_name| { cm_changed.lock().insert(cm_name); });
+    let rx_repo_stream = ReceiverStream::new(rx_repo).map(|_| ());
 
     let pod_watcher_stream = pod_watcher.applied_objects()
         .try_filter_map(move |p| {
